@@ -25,8 +25,13 @@ and the sidebar titles are short summaries written by the model itself.
   title of at most six words, using constrained decoding so the reply is
   parseable JSON rather than "Sure! Here's a title:".
 - **Token-by-token streaming** with a stop button. Stopping keeps the partial reply.
+- **Generation never blocks the UI.** Start a new chat or open another one while a
+  reply is still streaming; it keeps running and picks up where it left off when
+  you come back. Several chats can generate at once, and the sidebar marks the
+  ones still working.
 - **Markdown rendering** — code blocks with copy buttons, lists, tables, quotes.
-- **Rename, regenerate title, delete.** A manual rename is never overwritten.
+- **Rename, regenerate title, delete.** A manual rename is never overwritten, and
+  deletes are soft — the rows stay on disk behind a flag.
 - Light and dark themes, keyboard shortcuts, and no build step or CDN dependency.
 
 ## Requirements
@@ -82,7 +87,7 @@ app/
 static/
   index.html  Single page
   style.css   Theme
-  app.js      UI, streaming client, small Markdown renderer
+  app.js      UI, per-chat streaming client, small Markdown renderer
 ```
 
 ### Persistence
@@ -107,8 +112,24 @@ Nothing outside this module writes SQL, so a different database means writing on
 subclass and changing the single instantiation in `app/main.py`. SQLite is
 synchronous, so `SQLiteChatStore` runs each statement in a worker thread and
 guards the shared connection with a lock — the event loop stays free while a
-reply streams. `messages.chat_id` cascades on delete, so removing a chat removes
-its history.
+reply streams.
+
+**Deletes are soft.** `delete_chat` and `delete_message` set `deleted = 1` and
+stamp `deleted_at`; no statement in `store.py` removes a row, and every read
+filters the flag out. So a delete hides data instead of destroying it, and
+recovering one is a single `UPDATE`:
+
+```sql
+UPDATE chats SET deleted = 0, deleted_at = NULL WHERE id = '…';
+```
+
+Deleting a chat flags only the chat row — its messages keep `deleted = 0` and
+become unreachable through it, so a restore does not have to guess which
+messages the user had already deleted individually. Because the foreign key
+still matches a soft-deleted chat, `add_message` checks the flag itself and
+raises `LookupError` rather than writing into a deleted conversation. On an
+existing database the two columns are added by an `ALTER TABLE` migration at
+startup.
 
 ### Inference
 
@@ -122,6 +143,9 @@ backend:
   chats cannot leak into one another — the database stays the single source of
   truth. Passing `model_id` to `ChatContext` lets mellea trim history to the
   model's context window instead of overflowing it.
+  Each request builds its own session, so generations for different chats are
+  independent and run in parallel — which is what lets the UI leave one chat
+  streaming while you work in another.
 - `summarize_title()` uses a separate, historyless session so titling never
   pollutes the conversation, and `format=ChatTitle` to constrain the output to
   JSON. If the model is unreachable or returns something unusable it falls back
@@ -136,7 +160,7 @@ backend:
 | `POST` | `/api/chats` | Create a chat |
 | `GET` | `/api/chats/{id}` | Chat plus its messages |
 | `PATCH` | `/api/chats/{id}` | Rename (marks the title user-owned) |
-| `DELETE` | `/api/chats/{id}` | Delete a chat and its messages |
+| `DELETE` | `/api/chats/{id}` | Soft-delete a chat and its messages |
 | `POST` | `/api/chats/{id}/messages` | Send a message, stream the reply |
 | `POST` | `/api/chats/{id}/title` | Regenerate the title now |
 | `GET` | `/api/health` | Probe the llama-server |
@@ -171,3 +195,11 @@ This is intentionally single-user: there is no authentication and no per-user
 scoping, and it binds to localhost. Put it behind your own auth before exposing
 it on a network. Model output is HTML-escaped before Markdown rendering, and
 links are restricted to `http(s)` and `mailto`.
+
+Soft-deleted rows are never purged automatically. On a long-lived database,
+reclaim them yourself when you are sure you want them gone:
+
+```sql
+DELETE FROM messages WHERE deleted = 1;
+DELETE FROM chats    WHERE deleted = 1;   -- cascades to remaining messages
+```

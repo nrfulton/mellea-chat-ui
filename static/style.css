@@ -187,6 +187,11 @@ svg {
   font-style: italic;
 }
 
+/* A chat that is still generating while the user works elsewhere. */
+.chat-item.streaming .row-meta {
+  color: var(--accent);
+}
+
 .row-del {
   position: absolute;
   top: 50%;

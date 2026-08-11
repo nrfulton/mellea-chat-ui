@@ -10,10 +10,13 @@
   const state = {
     chats: [],
     currentId: null,
-    streaming: false,
-    controller: null,
+    // Live generations keyed by chat id. Generation belongs to a chat, not to
+    // the window, so starting or opening another chat never has to wait for it.
+    streams: new Map(),
     filter: '',
   };
+
+  const CARET = '<span class="caret"></span>';
 
   const $ = (id) => document.getElementById(id);
   const el = {
@@ -283,9 +286,11 @@
     }
 
     for (const chat of chats) {
+      const live = state.streams.has(chat.id);
       const item = document.createElement('button');
       item.className = 'chat-item' + (chat.id === state.currentId ? ' active' : '');
-      if (chat.message_count === 0) item.classList.add('pending');
+      if (chat.message_count === 0 && !live) item.classList.add('pending');
+      if (live) item.classList.add('streaming');
       item.dataset.id = chat.id;
 
       const title = document.createElement('span');
@@ -294,9 +299,12 @@
 
       const meta = document.createElement('span');
       meta.className = 'row-meta';
-      meta.textContent = chat.message_count
-        ? `${chat.message_count} message${chat.message_count === 1 ? '' : 's'} · ${relTime(chat.updated_at)}`
-        : 'Empty';
+      // Several chats can generate at once, so say which ones are working.
+      meta.textContent = live
+        ? 'Generating…'
+        : chat.message_count
+          ? `${chat.message_count} message${chat.message_count === 1 ? '' : 's'} · ${relTime(chat.updated_at)}`
+          : 'Empty';
 
       const del = document.createElement('button');
       del.className = 'row-del';
@@ -333,6 +341,17 @@
     el.banner.hidden = !msg;
   }
 
+  // A failure in a chat the user has navigated away from still has to surface,
+  // so name the chat it came from.
+  function notify(chatId, msg) {
+    if (state.currentId === chatId) {
+      showBanner(msg);
+      return;
+    }
+    const chat = state.chats.find((c) => c.id === chatId);
+    showBanner(chat ? `${chat.title}: ${msg}` : msg);
+  }
+
   function setChatChrome(chat) {
     const has = Boolean(chat);
     el.title.textContent = has ? chat.title : 'Chat';
@@ -340,12 +359,58 @@
     el.retitleBtn.hidden = !has || !chat.message_count;
   }
 
-  function setBusy(busy) {
-    state.streaming = busy;
+  // ------------------------------------------------------------ live streams
+  // The composer follows the chat on screen: Stop appears only when *this*
+  // chat is generating, so another chat stays sendable meanwhile.
+  function syncComposer() {
+    const busy = state.streams.has(state.currentId);
     el.send.hidden = busy;
     el.stop.hidden = !busy;
     el.input.disabled = false;
-    el.newChat.disabled = busy;
+  }
+
+  function paintStream(rec, final = false) {
+    if (!rec.body) return; // Chat is off screen; text keeps accumulating.
+    if (rec.painting && !final) return;
+    rec.painting = true;
+    requestAnimationFrame(() => {
+      rec.painting = false;
+      // The user may have switched chats between frames.
+      if (!rec.body) return;
+      rec.body.innerHTML = renderMarkdown(rec.text) + (final ? '' : CARET);
+      if (state.currentId === rec.chatId) scrollToBottom();
+    });
+  }
+
+  // Rebind a running generation to a freshly rendered transcript, so coming
+  // back to a chat mid-flight resumes showing tokens instead of a gap.
+  function attachStream(chatId, messages) {
+    const rec = state.streams.get(chatId);
+    if (!rec) return;
+
+    const welcome = el.messages.querySelector('.welcome');
+    if (welcome) el.messages.innerHTML = '';
+
+    const last = messages[messages.length - 1];
+    if (!last || last.role !== 'user' || last.content !== rec.userText) {
+      // The user turn is not committed yet; show it so the turn isn't orphaned.
+      el.messages.appendChild(messageNode('user', rec.userText));
+    }
+
+    rec.node = messageNode('assistant', '');
+    rec.body = rec.node.querySelector('.body');
+    rec.body.innerHTML = CARET;
+    el.messages.appendChild(rec.node);
+    paintStream(rec, false);
+    scrollToBottom(true);
+  }
+
+  function detachStreams() {
+    // renderMessages() wipes the transcript, so drop the stale paint targets.
+    for (const rec of state.streams.values()) {
+      rec.node = null;
+      rec.body = null;
+    }
   }
 
   // ---------------------------------------------------------------- actions
@@ -356,23 +421,27 @@
   }
 
   async function selectChat(id, { focus = true } = {}) {
-    if (state.streaming) return;
     showBanner('');
     state.currentId = id;
     localStorage.setItem('lastChatId', id);
 
     const { chat, messages } = await api(`/api/chats/${id}`);
     setChatChrome(chat);
+    detachStreams();
     renderMessages(messages);
+    attachStream(id, messages);
+    syncComposer();
     renderSidebar();
     if (window.innerWidth <= 760) el.sidebar.classList.add('collapsed');
     if (focus) el.input.focus();
   }
 
   async function newChat() {
-    if (state.streaming) return;
-    // Reuse an existing empty chat instead of piling up blank threads.
-    const blank = state.chats.find((c) => c.message_count === 0);
+    // Reuse an existing empty chat instead of piling up blank threads — but not
+    // one that is generating: its message_count is still the pre-send 0 here,
+    // and reusing it would drop the user back into the chat they left.
+    const blank = state.chats.find(
+      (c) => c.message_count === 0 && !state.streams.has(c.id));
     if (blank) {
       await selectChat(blank.id);
       return;
@@ -383,8 +452,9 @@
   }
 
   async function deleteChat(id, title) {
-    if (state.streaming) return;
     if (!confirm(`Delete "${title}"? This cannot be undone.`)) return;
+    // Stop a generation for the chat that is about to disappear.
+    state.streams.get(id)?.controller.abort();
     await api(`/api/chats/${id}`, { method: 'DELETE' });
     state.chats = state.chats.filter((c) => c.id !== id);
     if (state.currentId === id) {
@@ -394,7 +464,9 @@
         await selectChat(state.chats[0].id);
       } else {
         setChatChrome(null);
+        detachStreams();
         renderMessages([]);
+        syncComposer();
       }
     }
     renderSidebar();
@@ -418,7 +490,8 @@
 
   async function regenerateTitle() {
     const chat = state.chats.find((c) => c.id === state.currentId);
-    if (!chat || state.streaming) return;
+    // Retitling mid-generation would race the automatic title write.
+    if (!chat || state.streams.has(chat.id)) return;
     el.retitleBtn.disabled = true;
     try {
       const { title } = await api(`/api/chats/${chat.id}/title`, { method: 'POST' });
@@ -446,32 +519,34 @@
 
     // Placeholder assistant bubble with a blinking caret.
     const node = messageNode('assistant', '');
-    const body = node.querySelector('.body');
-    body.innerHTML = '<span class="caret"></span>';
+    node.querySelector('.body').innerHTML = CARET;
     el.messages.appendChild(node);
     scrollToBottom(true);
 
-    setBusy(true);
-    state.controller = new AbortController();
-
-    let acc = '';
-    let painting = false;
-    const paint = (final = false) => {
-      if (painting && !final) return;
-      painting = true;
-      requestAnimationFrame(() => {
-        painting = false;
-        body.innerHTML = renderMarkdown(acc) + (final ? '' : '<span class="caret"></span>');
-        scrollToBottom();
-      });
+    // Everything this generation needs lives in the record, not in the DOM, so
+    // it survives the user switching to — or starting — another chat.
+    const rec = {
+      chatId,
+      controller: new AbortController(),
+      text: '',
+      userText: text,
+      node,
+      body: node.querySelector('.body'),
+      painting: false,
     };
+    state.streams.set(chatId, rec);
+    syncComposer();
+    renderSidebar();
+
+    const paint = (final = false) => paintStream(rec, final);
+    const visible = () => state.currentId === chatId;
 
     try {
       const res = await fetch(`/api/chats/${chatId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content: text }),
-        signal: state.controller.signal,
+        signal: rec.controller.signal,
       });
 
       if (!res.ok || !res.body) {
@@ -499,17 +574,20 @@
           try { evt = JSON.parse(line); } catch { continue; }
 
           if (evt.type === 'delta') {
-            acc += evt.text;
+            rec.text += evt.text;
             paint();
           } else if (evt.type === 'title') {
             const chat = state.chats.find((c) => c.id === chatId);
-            if (chat) { chat.title = evt.title; setChatChrome(chat); }
+            if (chat) {
+              chat.title = evt.title;
+              if (visible()) setChatChrome(chat);
+            }
             renderSidebar();
           } else if (evt.type === 'error') {
-            showBanner(evt.message);
-            if (evt.removed_message_id) {
+            notify(chatId, evt.message);
+            if (evt.removed_message_id && visible()) {
               // Server discarded the user turn; drop both bubbles.
-              node.remove();
+              rec.node?.remove();
               const bubbles = el.messages.querySelectorAll('.msg.user');
               if (bubbles.length) bubbles[bubbles.length - 1].remove();
             }
@@ -523,21 +601,21 @@
         // Stopped by the user: keep whatever streamed in.
         paint(true);
       } else {
-        showBanner(err.message || 'Something went wrong.');
-        if (!acc) node.remove();
+        notify(chatId, err.message || 'Something went wrong.');
+        if (!rec.text) rec.node?.remove();
         else paint(true);
       }
     } finally {
-      setBusy(false);
-      state.controller = null;
+      state.streams.delete(chatId);
+      syncComposer();
       // Resync counts, ordering and any server-side title change.
       try { await refreshChats(); } catch {}
-      if (!acc.trim()) {
+      if (!rec.text.trim()) {
         // Nothing was generated; make sure the caret does not linger.
-        if (node.isConnected) node.remove();
-        if (!el.messages.children.length) renderMessages([]);
+        if (rec.node?.isConnected) rec.node.remove();
+        if (visible() && !el.messages.children.length) renderMessages([]);
       }
-      el.input.focus();
+      if (visible()) el.input.focus();
     }
   }
 
@@ -545,7 +623,8 @@
   el.composer.addEventListener('submit', async (e) => {
     e.preventDefault();
     const text = el.input.value.trim();
-    if (!text || state.streaming) return;
+    // One generation per chat — other chats are free.
+    if (!text || state.streams.has(state.currentId)) return;
 
     if (!state.currentId) await newChat();
 
@@ -567,7 +646,9 @@
   }
   el.input.addEventListener('input', autosize);
 
-  el.stop.addEventListener('click', () => state.controller?.abort());
+  el.stop.addEventListener('click', () => {
+    state.streams.get(state.currentId)?.controller.abort();
+  });
   el.newChat.addEventListener('click', () => newChat().catch((e) => showBanner(e.message)));
   el.renameBtn.addEventListener('click', () => renameChat().catch((e) => showBanner(e.message)));
   el.retitleBtn.addEventListener('click', regenerateTitle);
@@ -600,9 +681,9 @@
     if (mod && e.shiftKey && e.key.toLowerCase() === 'o') { e.preventDefault(); newChat(); }
   });
 
-  // Warn if the user tries to leave mid-generation.
+  // Warn if the user tries to leave while any chat is still generating.
   window.addEventListener('beforeunload', (e) => {
-    if (state.streaming) { e.preventDefault(); e.returnValue = ''; }
+    if (state.streams.size) { e.preventDefault(); e.returnValue = ''; }
   });
 
   // ------------------------------------------------------------------- boot

@@ -9,6 +9,14 @@ All methods are async. SQLite itself is synchronous, so the concrete store
 hands each statement to a worker thread (`asyncio.to_thread`) and guards the
 shared connection with a lock, which keeps the event loop responsive while a
 generation is streaming.
+
+Deletes are soft: `delete_chat` and `delete_message` set a `deleted` flag and
+stamp `deleted_at`, and every read filters the flag out. No statement in this
+module removes a row, so a delete is recoverable and nothing but an explicit
+purge loses data. Deleting a chat marks only the chat — its messages keep
+`deleted = 0` and are unreachable through the chat, which keeps a future
+restore a single UPDATE instead of a guess about which messages the user had
+already deleted by hand.
 """
 
 from __future__ import annotations
@@ -123,26 +131,39 @@ class ChatStore(ABC):
 
     @abstractmethod
     async def delete_chat(self, chat_id: str) -> bool:
-        """Delete a chat and its messages. Returns False if it did not exist."""
+        """Mark a chat deleted, hiding it and its messages.
+
+        The rows are kept; implementations must flag rather than remove.
+        Returns False if the chat does not exist or was already deleted.
+        """
 
     # --- messages ---
 
     @abstractmethod
     async def add_message(self, chat_id: str, role: str, content: str) -> Message:
-        """Append a message and bump the chat's `updated_at`."""
+        """Append a message and bump the chat's `updated_at`.
+
+        Raises `LookupError` if the chat does not exist or has been deleted.
+        """
 
     @abstractmethod
     async def list_messages(self, chat_id: str) -> list[Message]:
-        """Return a chat's messages in chronological order."""
+        """Return a chat's live messages in chronological order."""
 
     @abstractmethod
     async def delete_message(self, chat_id: str, message_id: int) -> bool:
-        """Remove a single message. Returns False if it was not found."""
+        """Mark a single message deleted, keeping the row.
+
+        Returns False if it was not found or was already deleted.
+        """
 
 
 class SQLiteChatStore(ChatStore):
     """SQLite-backed `ChatStore`."""
 
+    # Tables first, then the columns a pre-soft-delete database may be missing,
+    # then indexes — the partial indexes below reference `deleted`, so they can
+    # only be created once the migration has added it.
     _SCHEMA = """
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
@@ -152,7 +173,9 @@ class SQLiteChatStore(ChatStore):
         title        TEXT NOT NULL,
         title_is_auto INTEGER NOT NULL DEFAULT 1,
         created_at   TEXT NOT NULL,
-        updated_at   TEXT NOT NULL
+        updated_at   TEXT NOT NULL,
+        deleted      INTEGER NOT NULL DEFAULT 0,
+        deleted_at   TEXT
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -160,13 +183,31 @@ class SQLiteChatStore(ChatStore):
         chat_id    TEXT NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
         role       TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
         content    TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        deleted    INTEGER NOT NULL DEFAULT 0,
+        deleted_at TEXT
     );
+    """
 
+    # (table, column, definition) added to databases that predate the column.
+    _MIGRATIONS = (
+        ("chats", "deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("chats", "deleted_at", "TEXT"),
+        ("messages", "deleted", "INTEGER NOT NULL DEFAULT 0"),
+        ("messages", "deleted_at", "TEXT"),
+    )
+
+    # Partial indexes: every query reads live rows only, so deleted rows do not
+    # need to be indexed and do not slow the common path down as they pile up.
+    _INDEXES = """
     CREATE INDEX IF NOT EXISTS idx_messages_chat
         ON messages (chat_id, id);
     CREATE INDEX IF NOT EXISTS idx_chats_updated
         ON chats (updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_messages_live
+        ON messages (chat_id, id) WHERE deleted = 0;
+    CREATE INDEX IF NOT EXISTS idx_chats_live
+        ON chats (updated_at DESC) WHERE deleted = 0;
     """
 
     def __init__(self, db_path: str | Path) -> None:
@@ -185,8 +226,19 @@ class SQLiteChatStore(ChatStore):
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.executescript(self._SCHEMA)
+        self._migrate_sync(conn)
+        conn.executescript(self._INDEXES)
         conn.commit()
         self._conn = conn
+
+    def _migrate_sync(self, conn: sqlite3.Connection) -> None:
+        """Add any columns this build expects but the file does not have yet."""
+        for table, column, definition in self._MIGRATIONS:
+            existing = {
+                row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     async def close(self) -> None:
         await asyncio.to_thread(self._close_sync)
@@ -240,12 +292,15 @@ class SQLiteChatStore(ChatStore):
             return db.execute(
                 """
                 SELECT c.*,
-                       (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id)
+                       (SELECT COUNT(*) FROM messages m
+                         WHERE m.chat_id = c.id AND m.deleted = 0)
                            AS message_count,
                        (SELECT m.content FROM messages m
-                         WHERE m.chat_id = c.id ORDER BY m.id LIMIT 1)
+                         WHERE m.chat_id = c.id AND m.deleted = 0
+                         ORDER BY m.id LIMIT 1)
                            AS preview
                   FROM chats c
+                 WHERE c.deleted = 0
                  ORDER BY c.updated_at DESC, c.created_at DESC
                 """
             ).fetchall()
@@ -258,13 +313,15 @@ class SQLiteChatStore(ChatStore):
             return db.execute(
                 """
                 SELECT c.*,
-                       (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id)
+                       (SELECT COUNT(*) FROM messages m
+                         WHERE m.chat_id = c.id AND m.deleted = 0)
                            AS message_count,
                        (SELECT m.content FROM messages m
-                         WHERE m.chat_id = c.id ORDER BY m.id LIMIT 1)
+                         WHERE m.chat_id = c.id AND m.deleted = 0
+                         ORDER BY m.id LIMIT 1)
                            AS preview
                   FROM chats c
-                 WHERE c.id = ?
+                 WHERE c.id = ? AND c.deleted = 0
                 """,
                 (chat_id,),
             ).fetchone()
@@ -275,7 +332,8 @@ class SQLiteChatStore(ChatStore):
     async def set_title(self, chat_id: str, title: str, *, is_auto: bool) -> None:
         def op(db: sqlite3.Connection) -> None:
             db.execute(
-                "UPDATE chats SET title = ?, title_is_auto = ? WHERE id = ?",
+                "UPDATE chats SET title = ?, title_is_auto = ?"
+                " WHERE id = ? AND deleted = 0",
                 (title, 1 if is_auto else 0, chat_id),
             )
             db.commit()
@@ -283,8 +341,15 @@ class SQLiteChatStore(ChatStore):
         await self._run(op)
 
     async def delete_chat(self, chat_id: str) -> bool:
+        deleted_at = _now()
+
         def op(db: sqlite3.Connection) -> bool:
-            cur = db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+            # Soft delete: the chat and its messages stay on disk, hidden.
+            cur = db.execute(
+                "UPDATE chats SET deleted = 1, deleted_at = ?"
+                " WHERE id = ? AND deleted = 0",
+                (deleted_at, chat_id),
+            )
             db.commit()
             return cur.rowcount > 0
 
@@ -299,6 +364,14 @@ class SQLiteChatStore(ChatStore):
         created_at = _now()
 
         def op(db: sqlite3.Connection) -> int:
+            # The foreign key still matches a soft-deleted chat, so check the
+            # flag explicitly rather than relying on the constraint.
+            live = db.execute(
+                "SELECT 1 FROM chats WHERE id = ? AND deleted = 0", (chat_id,)
+            ).fetchone()
+            if live is None:
+                raise LookupError(f"chat {chat_id!r} does not exist")
+
             cur = db.execute(
                 "INSERT INTO messages (chat_id, role, content, created_at)"
                 " VALUES (?, ?, ?, ?)",
@@ -323,7 +396,9 @@ class SQLiteChatStore(ChatStore):
     async def list_messages(self, chat_id: str) -> list[Message]:
         def op(db: sqlite3.Connection) -> list[sqlite3.Row]:
             return db.execute(
-                "SELECT * FROM messages WHERE chat_id = ? ORDER BY id", (chat_id,)
+                "SELECT * FROM messages WHERE chat_id = ? AND deleted = 0"
+                " ORDER BY id",
+                (chat_id,),
             ).fetchall()
 
         rows = await self._run(op)
@@ -339,10 +414,13 @@ class SQLiteChatStore(ChatStore):
         ]
 
     async def delete_message(self, chat_id: str, message_id: int) -> bool:
+        deleted_at = _now()
+
         def op(db: sqlite3.Connection) -> bool:
             cur = db.execute(
-                "DELETE FROM messages WHERE id = ? AND chat_id = ?",
-                (message_id, chat_id),
+                "UPDATE messages SET deleted = 1, deleted_at = ?"
+                " WHERE id = ? AND chat_id = ? AND deleted = 0",
+                (deleted_at, message_id, chat_id),
             )
             db.commit()
             return cur.rowcount > 0

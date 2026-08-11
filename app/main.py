@@ -154,6 +154,11 @@ def _spawn(coro) -> None:
 async def _persist_interrupted(chat_id: str, reply: str, fallback_title: str | None):
     """Save whatever streamed before the client went away."""
     try:
+        if await store.get_chat(chat_id) is None:
+            # The chat was deleted while it was generating — which is allowed,
+            # so this is routine, not an error.
+            logger.info("Dropping interrupted reply for deleted chat %s", chat_id)
+            return
         if reply:
             await store.add_message(chat_id, "assistant", reply)
             logger.info("Saved partial reply for chat %s (%d chars)", chat_id, len(reply))
@@ -174,7 +179,11 @@ async def send_message(chat_id: str, payload: NewMessage):
 
     # History as it stood *before* this turn; the engine appends the new turn.
     history = await store.list_messages(chat_id)
-    user_message = await store.add_message(chat_id, "user", content)
+    try:
+        user_message = await store.add_message(chat_id, "user", content)
+    except LookupError:
+        # Deleted between the lookup above and this insert.
+        raise HTTPException(status_code=404, detail="Chat not found") from None
     # Titles are generated from the first exchange only.
     should_title = chat.title_is_auto and len(history) == 0
 
