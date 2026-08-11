@@ -335,8 +335,8 @@ svg {
   overflow-wrap: break-word;
 }
 
-.msg .body > *:first-child { margin-top: 0; }
-.msg .body > *:last-child { margin-bottom: 0; }
+.msg .text > *:first-child { margin-top: 0; }
+.msg .text > *:last-child { margin-bottom: 0; }
 
 .msg p { margin: 0 0 .75em; }
 .msg ul, .msg ol { margin: 0 0 .75em; padding-left: 1.4em; }
@@ -437,13 +437,94 @@ svg {
   padding: 3px 2px;   /* room for the scrollbar and for tall glyphs */
 }
 .msg .katex-display > .katex { text-align: center; }
-.msg .body > .katex-display:first-child { margin-top: 0; }
-.msg .body > .katex-display:last-child { margin-bottom: 0; }
+.msg .text > .katex-display:first-child { margin-top: 0; }
+.msg .text > .katex-display:last-child { margin-bottom: 0; }
 /* Inline math inherits the bubble's colour rather than KaTeX's default. */
 .msg .katex, .msg .katex .mord, .msg .katex .mbin,
 .msg .katex .mrel, .msg .katex .mopen, .msg .katex .mclose { color: inherit; }
 /* Shown when KaTeX is missing: the LaTeX source, so nothing is ever lost. */
 .msg code.math-raw { color: var(--text-dim); }
+
+/* What the model did before answering — one row per tool call, output folded
+   away behind it (see paintTools in app.js). */
+.msg .tools {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 .75em;
+}
+
+.tool-call {
+  font-size: 12.5px;
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.tool-call > summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  color: var(--text-dim);
+  cursor: pointer;
+  list-style: none;
+}
+
+/* Hide the native disclosure triangle; the status dot below stands in for it. */
+.tool-call > summary::-webkit-details-marker { display: none; }
+
+.tool-call > summary::before {
+  content: '';
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.tool-call.running > summary::before {
+  background: var(--accent);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+.tool-call.failed > summary::before { background: var(--danger); }
+.tool-call:hover > summary { color: var(--text); }
+
+.tool-label { font-weight: 550; white-space: nowrap; }
+
+.tool-arg {
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: .93em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tool-meta {
+  margin-left: auto;
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-output {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 11.8px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+}
+
+@keyframes pulse { 50% { opacity: .25; } }
 
 /* blinking caret while streaming */
 .caret {

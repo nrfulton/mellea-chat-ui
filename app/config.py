@@ -18,6 +18,14 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
+def _flag(name: str, default: bool) -> bool:
+    """Read a boolean environment variable, accepting the usual spellings."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     """Runtime settings for the chat interface."""
@@ -42,6 +50,33 @@ class Settings:
 
     # Seconds to wait for a single streaming chunk before giving up.
     stream_timeout: float = float(os.getenv("STREAM_TIMEOUT", "120"))
+
+    # --- Tools (see app/tools.py) ---
+    # Master switch. Off means no relevance query and no tool schemas, so a turn
+    # costs exactly one generation again.
+    tools_enabled: bool = _flag("TOOLS_ENABLED", True)
+    web_search_enabled: bool = _flag("WEB_SEARCH_ENABLED", True)
+    # Runs model-authored code on this machine. Limited, but not sandboxed —
+    # read the warning at the top of app/tools.py before exposing this app.
+    python_tool_enabled: bool = _flag("PYTHON_TOOL_ENABLED", True)
+
+    # How many times the model may call tools before it has to answer. Each
+    # round is one extra request to the inference server.
+    tool_max_rounds: int = int(os.getenv("TOOL_MAX_ROUNDS", "2"))
+    # Ceiling on a single tool's output, so a chatty result cannot crowd the
+    # conversation out of the context window.
+    tool_output_chars: int = int(os.getenv("TOOL_OUTPUT_CHARS", "4000"))
+
+    # "duckduckgo" scrapes the no-JavaScript HTML endpoint and needs no
+    # credentials, but rate-limits bursts; "searxng" uses the JSON API of an
+    # instance you point SEARCH_URL at, and is the better option if you run one.
+    search_provider: str = os.getenv("SEARCH_PROVIDER", "duckduckgo")
+    search_url: str = os.getenv("SEARCH_URL", "")  # empty: provider default
+    search_results: int = int(os.getenv("SEARCH_RESULTS", "5"))
+    search_timeout: float = float(os.getenv("SEARCH_TIMEOUT", "12"))
+
+    python_timeout: float = float(os.getenv("PYTHON_TIMEOUT", "15"))
+    python_memory_mb: int = int(os.getenv("PYTHON_MEMORY_MB", "512"))
 
     # --- Storage ---
     db_path: Path = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "chat.db")))

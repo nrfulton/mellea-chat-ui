@@ -29,6 +29,10 @@ and the sidebar titles are short summaries written by the model itself.
   reply is still streaming; it keeps running and picks up where it left off when
   you come back. Several chats can generate at once, and the sidebar marks the
   ones still working.
+- **Tools: web search and a Python interpreter.** Before each reply a cheap query
+  decides whether either could matter; only the relevant ones are offered to the
+  model, and anything it calls is executed and fed back so it answers from real
+  results. The UI shows what ran, with the output folded away behind it.
 - **Markdown rendering** — code blocks with copy buttons, lists, tables, quotes.
 - **LaTeX rendering.** `\[ ... \]`, `\( ... \)`, `$$ ... $$`, cautious `$ ... $` and
   the usual environments (`align`, `cases`, `pmatrix`, ...) are typeset with KaTeX.
@@ -42,6 +46,10 @@ and the sidebar titles are short summaries written by the model itself.
 - Python 3.10+
 - A reachable `llama-server` exposing the OpenAI-compatible `/v1` API
 - `pip install -r requirements.txt`
+
+The tools need nothing extra: search goes through `urllib`, and the interpreter
+runs the same `python3` in a subprocess. The model must support tool calling —
+Granite does, and a backend that does not will simply answer in prose.
 
 ## Run
 
@@ -71,11 +79,28 @@ Everything is environment-driven; the defaults match this deployment.
 | `STREAM_TIMEOUT` | `120` | Seconds to wait for one chunk |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address |
 
+Tools have their own block, all optional:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TOOLS_ENABLED` | `1` | Master switch. `0` skips the relevance query entirely |
+| `WEB_SEARCH_ENABLED` | `1` | Offer `web_search` |
+| `PYTHON_TOOL_ENABLED` | `1` | Offer `run_python` (see the warning below) |
+| `TOOL_MAX_ROUNDS` | `2` | Tool-calling turns before the model must answer |
+| `TOOL_OUTPUT_CHARS` | `4000` | Cap on what one tool may return to the model |
+| `SEARCH_PROVIDER` | `duckduckgo` | `duckduckgo` (HTML scrape) or `searxng` (JSON API) |
+| `SEARCH_URL` | provider default | Override the endpoint, e.g. your SearxNG `/search` |
+| `SEARCH_RESULTS` | `5` | Results shown to the model |
+| `SEARCH_TIMEOUT` | `12` | Seconds per search request |
+| `PYTHON_TIMEOUT` | `15` | Wall-clock and CPU seconds per program |
+| `PYTHON_MEMORY_MB` | `512` | Address-space limit per program |
+
 Check connectivity at any time:
 
 ```bash
 curl localhost:8000/api/health
-# {"ok":true,"model":"ibm-research/granite-5.0-20B-SFT","endpoint":"…","reply":"OK"}
+# {"ok":true,"model":"ibm-research/granite-5.0-20B-SFT","endpoint":"…",
+#  "tools":["web_search","run_python"],"reply":"OK"}
 ```
 
 The status dot at the bottom of the sidebar reflects the same probe.
@@ -86,7 +111,8 @@ The status dot at the bottom of the sidebar reflects the same probe.
 app/
   config.py   Environment-driven settings
   store.py    ChatStore (abstract) + SQLiteChatStore
-  engine.py   Mellea orchestration: streaming replies, title summarization
+  engine.py   Mellea orchestration: streaming replies, tool rounds, titles
+  tools.py    The two tools themselves: web search and the Python subprocess
   main.py     FastAPI routes and the NDJSON streaming endpoint
 static/
   index.html  Single page
@@ -139,7 +165,7 @@ startup.
 
 ### Inference
 
-`app/engine.py` is the only module that touches a model. Both entry points build
+`app/engine.py` is the only module that touches a model. Every entry point builds
 a mellea session pointed at `llama_base_url` through mellea's OpenAI-compatible
 backend:
 
@@ -152,11 +178,81 @@ backend:
   Each request builds its own session, so generations for different chats are
   independent and run in parallel — which is what lets the UI leave one chat
   streaming while you work in another.
+  It also drives the tool loop described below, streaming text from every model
+  turn — not just the last one — so the user is never watching a blank bubble
+  while a tool runs.
+- `select_tools()` is the relevance query in front of it, and `_run_tool()`
+  executes whatever comes back. See [Tools](#tools).
 - `summarize_title()` uses a separate, historyless session so titling never
   pollutes the conversation, and `format=ChatTitle` to constrain the output to
   JSON. If the model is unreachable or returns something unusable it falls back
   to a truncation of the user's own words — a failed title never breaks a working
   chat.
+
+### Tools
+
+Everything here runs through mellea: the tools are `MelleaTool` objects passed as
+`ModelOption.TOOLS`, and mellea derives each JSON schema from the function
+signature and its `Args:` docstring, so the docstring *is* the model's briefing.
+A turn has three stages.
+
+**1. Is a tool relevant?** `select_tools()` asks the model, over the last few
+turns plus the new message, with `format=ToolChoice` — constrained decoding, so
+the answer is `{"web_search": false, "run_python": true}` rather than a paragraph
+about what it might do. Two properties matter more than accuracy here: it is one
+short call, and it **fails closed**. Any error, any unparseable answer, and the
+turn simply runs without tools, which is the outcome a user notices least. The
+decision is logged as `Tool relevance: [...]`.
+
+**2. Generate with only those tools.** The selected tools go into the generation
+call, and the system prompt gains a matching policy line. That addendum is not
+decoration: handed schemas and nothing else, the model will cheerfully do
+ten-digit arithmetic in its head and get it wrong, so it is told to *call*
+`run_python` rather than describe the call. Streaming is unaffected — text
+arrives token-by-token while tool calls accumulate, so "let me look that up"
+reaches the user before the search does.
+
+**3. Execute and feed back.** Each call is run in a worker thread (tools block
+for seconds; the event loop must not) and returned to the model as a `tool`
+message carrying its `tool_call_id`, exactly as the OpenAI protocol expects. The
+model may then call again, up to `TOOL_MAX_ROUNDS`; the final turn is issued with
+no tools on offer, so it has to answer. A tool that raises does not break the
+conversation — the exception is turned into text the model can read and work
+around.
+
+Two deliberate choices:
+
+- **`format=` and tool calling are mutually exclusive** in mellea's OpenAI
+  backend (constrained decoding supersedes tools), which is why the relevance
+  query is a separate, historyless session rather than a preamble to the real one.
+- **Tool traces are progress, not transcript.** Only the prose is stored, so the
+  database schema is untouched, later turns are not cluttered with search dumps,
+  and a reload shows the conversation rather than the machinery.
+
+`web_search` defaults to DuckDuckGo's no-JavaScript HTML endpoint, over POST,
+which is what that page's own form uses and is challenged far less than GET.
+Being honest about it: **there is no API key and no SLA here.** A burst of
+searches gets an automated-traffic challenge (HTTP 202 and no results), and an
+IP that has been hammered stays throttled for a while. On failure the tool
+returns advice rather than an error — answer from your own knowledge and tell the
+user the search did not work — so a throttled search degrades the answer instead
+of breaking the turn. If you want reliability, run a
+[SearxNG](https://docs.searxng.org) instance with `json` in its `search.formats`
+and point the app at it:
+
+```bash
+SEARCH_PROVIDER=searxng SEARCH_URL=http://127.0.0.1:8888/search ./run.sh
+```
+
+> **`run_python` executes model-authored code on this machine.** It gets a
+> separate process in isolated mode (`python -I`), a wiped environment — not
+> `os.environ`, so endpoints and keys stay out of reach — a throwaway working
+> directory, its own process group, and `RLIMIT_AS` / `RLIMIT_CPU` /
+> `RLIMIT_FSIZE` plus a wall-clock timeout. That is damage control, **not a
+> sandbox**: the code still runs as the server user, can read what that user can
+> read, and can open network connections. There is no authentication in front of
+> it either (see Notes). Acceptable for a single user on localhost, which is what
+> this app is; anything else, set `PYTHON_TOOL_ENABLED=0`.
 
 ### Math
 
@@ -195,11 +291,19 @@ line — rather than SSE, so the client can POST the message and abort mid-strea
 
 ```json
 {"type": "user",  "message": {"id": 1, "role": "user", "content": "…"}}
-{"type": "delta", "text": "A B-tree"}
-{"type": "delta", "text": " index is…"}
-{"type": "title", "title": "B-Tree Index Basics"}
+{"type": "delta", "text": "Let me compute"}
+{"type": "delta", "text": " that exactly.\n\n"}
+{"type": "tool",  "phase": "start", "id": 1, "name": "run_python", "args": {"code": "…"}}
+{"type": "tool",  "phase": "end",   "id": 1, "name": "run_python", "ok": true, "ms": 412,
+                  "output": "4826665561"}
+{"type": "delta", "text": "The exact product is 4826665561."}
+{"type": "title", "title": "Exact Product Of Two Numbers"}
 {"type": "done",  "message": {"id": 2, "role": "assistant", "content": "…"}}
 ```
+
+`tool` events are paired by `id` and are display-only — they are not persisted,
+and only `delta` text becomes the stored reply. Long `args` and `output` are
+clipped for the browser; the model sees the full text.
 
 An `error` event carries a message; if generation failed before producing any
 text it also carries `removed_message_id`, because the server discards the
@@ -218,8 +322,10 @@ orphaned user turn so a retry does not duplicate it.
 
 This is intentionally single-user: there is no authentication and no per-user
 scoping, and it binds to localhost. Put it behind your own auth before exposing
-it on a network. Model output is HTML-escaped before Markdown rendering, and
-links are restricted to `http(s)` and `mailto`.
+it on a network — and note that with `run_python` enabled, anyone who can reach
+the port can get code executed on the box by asking for it. Model output is
+HTML-escaped before Markdown rendering, and links are restricted to `http(s)`
+and `mailto`.
 
 Soft-deleted rows are never purged automatically. On a long-lived database,
 reclaim them yourself when you are sure you want them gone:

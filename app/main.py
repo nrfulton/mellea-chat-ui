@@ -172,7 +172,7 @@ async def _persist_interrupted(chat_id: str, reply: str, fallback_title: str | N
 async def send_message(chat_id: str, payload: NewMessage):
     """Persist a user turn and stream the assistant's reply as NDJSON.
 
-    Event types: `user`, `delta`, `title`, `done`, `error`.
+    Event types: `user`, `delta`, `tool`, `title`, `done`, `error`.
     """
     chat = await _require_chat(chat_id)
     content = payload.content.strip()
@@ -199,9 +199,14 @@ async def send_message(chat_id: str, payload: NewMessage):
             yield _event("user", message=user_message.to_dict())
 
             try:
-                async for delta in engine.stream_reply(history, content):
-                    parts.append(delta)
-                    yield _event("delta", text=delta)
+                # The engine yields NDJSON-shaped events already: `delta` for
+                # text, `tool` for tool activity. Only text is part of the reply
+                # that gets saved; tool traces are live progress, not transcript.
+                async for event in engine.stream_reply(history, content):
+                    kind = event["type"]
+                    if kind == "delta":
+                        parts.append(event["text"])
+                    yield _event(kind, **{k: v for k, v in event.items() if k != "type"})
             except (asyncio.CancelledError, GeneratorExit):
                 # Client aborted (stop button or navigation): keep what we have.
                 interrupted = True
@@ -296,6 +301,7 @@ async def health() -> JSONResponse:
                 "ok": True,
                 "model": settings.model_id,
                 "endpoint": settings.llama_base_url,
+                "tools": engine.tool_names,
                 "reply": reply,
             }
         )

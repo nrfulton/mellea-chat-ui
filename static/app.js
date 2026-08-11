@@ -261,15 +261,21 @@
 
     const body = document.createElement('div');
     body.className = 'body';
+
+    // The prose lives in its own element so a tool trace can be placed above it
+    // without being wiped by the next repaint.
+    const text = document.createElement('div');
+    text.className = 'text';
     if (role === 'user') {
       // Show the user's text verbatim — no markdown interpretation.
       const p = document.createElement('p');
       p.style.whiteSpace = 'pre-wrap';
       p.textContent = content;
-      body.appendChild(p);
+      text.appendChild(p);
     } else {
-      body.innerHTML = renderMarkdown(content);
+      text.innerHTML = renderMarkdown(content);
     }
+    body.appendChild(text);
 
     wrap.append(who, body);
     return wrap;
@@ -397,16 +403,94 @@
   }
 
   function paintStream(rec, final = false) {
-    if (!rec.body) return; // Chat is off screen; text keeps accumulating.
+    if (!rec.out) return; // Chat is off screen; text keeps accumulating.
     if (rec.painting && !final) return;
     rec.painting = true;
     requestAnimationFrame(() => {
       rec.painting = false;
       // The user may have switched chats between frames.
-      if (!rec.body) return;
-      rec.body.innerHTML = renderMarkdown(rec.text) + (final ? '' : CARET);
+      if (!rec.out) return;
+      rec.out.innerHTML = renderMarkdown(rec.text) + (final ? '' : CARET);
       if (state.currentId === rec.chatId) scrollToBottom();
     });
+  }
+
+  // ------------------------------------------------------------- tool trace
+  // What the model did before answering. Live progress rather than transcript:
+  // it is not stored, so it is gone after a reload.
+  const TOOL_LABELS = {
+    web_search: ['Searching the web', 'Searched the web'],
+    run_python: ['Running Python', 'Ran Python'],
+  };
+
+  function toolLabel(call) {
+    const pair = TOOL_LABELS[call.name] || [call.name, call.name];
+    return pair[call.done ? 1 : 0];
+  }
+
+  function toolDetail(call) {
+    const args = call.args || {};
+    const raw = args.query ?? args.code ?? Object.values(args)[0] ?? '';
+    const first = String(raw).trim().split('\n')[0];
+    return first.length > 80 ? first.slice(0, 79) + '…' : first;
+  }
+
+  function paintTools(rec) {
+    if (!rec.node || !rec.tools.length) return;
+    let box = rec.node.querySelector('.tools');
+    if (!box) {
+      box = document.createElement('div');
+      box.className = 'tools';
+      rec.node.querySelector('.body').insertBefore(box, rec.out);
+    }
+
+    box.innerHTML = '';
+    for (const call of rec.tools) {
+      const item = document.createElement('details');
+      item.className = 'tool-call';
+      if (!call.done) item.classList.add('running');
+      if (call.done && !call.ok) item.classList.add('failed');
+
+      const summary = document.createElement('summary');
+      const label = document.createElement('span');
+      label.className = 'tool-label';
+      label.textContent = toolLabel(call) + (call.done ? '' : '…');
+      summary.appendChild(label);
+
+      const detail = toolDetail(call);
+      if (detail) {
+        const arg = document.createElement('span');
+        arg.className = 'tool-arg';
+        arg.textContent = detail;
+        summary.appendChild(arg);
+      }
+      if (call.done) {
+        const meta = document.createElement('span');
+        meta.className = 'tool-meta';
+        meta.textContent = `${(call.ms / 1000).toFixed(1)}s`;
+        summary.appendChild(meta);
+      }
+      item.appendChild(summary);
+
+      const output = document.createElement('pre');
+      output.className = 'tool-output';
+      output.textContent = call.done
+        ? call.output || '(no output)'
+        : 'Working…';
+      item.appendChild(output);
+      box.appendChild(item);
+    }
+  }
+
+  function recordTool(rec, evt) {
+    if (evt.phase === 'start') {
+      rec.tools.push({ id: evt.id, name: evt.name, args: evt.args, done: false });
+    } else {
+      const call = rec.tools.find((c) => c.id === evt.id);
+      if (!call) return;
+      Object.assign(call, { done: true, ok: evt.ok, ms: evt.ms, output: evt.output });
+    }
+    paintTools(rec);
   }
 
   // Rebind a running generation to a freshly rendered transcript, so coming
@@ -425,9 +509,10 @@
     }
 
     rec.node = messageNode('assistant', '');
-    rec.body = rec.node.querySelector('.body');
-    rec.body.innerHTML = CARET;
+    rec.out = rec.node.querySelector('.text');
+    rec.out.innerHTML = CARET;
     el.messages.appendChild(rec.node);
+    paintTools(rec);
     paintStream(rec, false);
     scrollToBottom(true);
   }
@@ -436,7 +521,7 @@
     // renderMessages() wipes the transcript, so drop the stale paint targets.
     for (const rec of state.streams.values()) {
       rec.node = null;
-      rec.body = null;
+      rec.out = null;
     }
   }
 
@@ -546,7 +631,7 @@
 
     // Placeholder assistant bubble with a blinking caret.
     const node = messageNode('assistant', '');
-    node.querySelector('.body').innerHTML = CARET;
+    node.querySelector('.text').innerHTML = CARET;
     el.messages.appendChild(node);
     scrollToBottom(true);
 
@@ -558,7 +643,8 @@
       text: '',
       userText: text,
       node,
-      body: node.querySelector('.body'),
+      out: node.querySelector('.text'),
+      tools: [],
       painting: false,
     };
     state.streams.set(chatId, rec);
@@ -603,6 +689,8 @@
           if (evt.type === 'delta') {
             rec.text += evt.text;
             paint();
+          } else if (evt.type === 'tool') {
+            recordTool(rec, evt);
           } else if (evt.type === 'title') {
             const chat = state.chats.find((c) => c.id === chatId);
             if (chat) {
