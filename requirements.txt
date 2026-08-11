@@ -1,0 +1,10 @@
+# Inference orchestration. Install from your local checkout if you have one:
+#   pip install -e /path/to/mellea
+mellea>=0.8.0
+# mellea's OpenAI-compatible backend talks to llama-server.
+openai>=1.60
+
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+# Storage uses the standard library's sqlite3 — no driver needed.
