@@ -71,9 +71,14 @@ class ChatEngine:
         """A session whose context mirrors `history`, ready for the next turn."""
         session = start_session(
             **self._base_kwargs(),
-            # model_id lets ChatContext trim to the server's context window
-            # instead of overflowing it on long conversations.
-            ctx=ChatContext(model_id=self._settings.model_id),
+            # Trim history to the serving window instead of overflowing it on
+            # long conversations. The explicit token limit takes priority over
+            # mellea's model-name lookup, which returns nothing for a locally
+            # served checkpoint and would leave history untrimmed.
+            ctx=ChatContext(
+                model_id=self._settings.model_id,
+                token_context_length_limit=self._settings.context_tokens,
+            ),
             model_options={
                 ModelOption.STREAM: True,
                 ModelOption.STREAM_TIMEOUT: self._settings.stream_timeout,

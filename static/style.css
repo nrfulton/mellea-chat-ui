@@ -427,6 +427,24 @@ svg {
 }
 .msg th { background: var(--bg-code); font-weight: 600; }
 
+/* LaTeX, typeset by the vendored KaTeX (see static/math.js) */
+.msg .katex { font-size: 1.06em; }
+.msg .katex-display {
+  margin: .85em 0;
+  /* Long equations scroll instead of stretching the bubble. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 3px 2px;   /* room for the scrollbar and for tall glyphs */
+}
+.msg .katex-display > .katex { text-align: center; }
+.msg .body > .katex-display:first-child { margin-top: 0; }
+.msg .body > .katex-display:last-child { margin-bottom: 0; }
+/* Inline math inherits the bubble's colour rather than KaTeX's default. */
+.msg .katex, .msg .katex .mord, .msg .katex .mbin,
+.msg .katex .mrel, .msg .katex .mopen, .msg .katex .mclose { color: inherit; }
+/* Shown when KaTeX is missing: the LaTeX source, so nothing is ever lost. */
+.msg code.math-raw { color: var(--text-dim); }
+
 /* blinking caret while streaming */
 .caret {
   display: inline-block;

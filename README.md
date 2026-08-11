@@ -14,7 +14,7 @@ and the sidebar titles are short summaries written by the model itself.
 │ B-Tree Index…  │                                      │
 │ 2 messages     ├──────────────────────────────────────┤
 │                │  [ Send a message…              ] ▶  │
-│ ● granite-4.1  │  Enter to send · Shift+Enter newline  │
+│ ● granite-5.0  │  Enter to send · Shift+Enter newline  │
 └────────────────┴──────────────────────────────────────┘
 ```
 
@@ -30,9 +30,12 @@ and the sidebar titles are short summaries written by the model itself.
   you come back. Several chats can generate at once, and the sidebar marks the
   ones still working.
 - **Markdown rendering** — code blocks with copy buttons, lists, tables, quotes.
+- **LaTeX rendering.** `\[ ... \]`, `\( ... \)`, `$$ ... $$`, cautious `$ ... $` and
+  the usual environments (`align`, `cases`, `pmatrix`, ...) are typeset with KaTeX.
 - **Rename, regenerate title, delete.** A manual rename is never overwritten, and
   deletes are soft — the rows stay on disk behind a flag.
-- Light and dark themes, keyboard shortcuts, and no build step or CDN dependency.
+- Light and dark themes, keyboard shortcuts, and no build step. KaTeX is vendored
+  rather than loaded from a CDN, so nothing is fetched at runtime.
 
 ## Requirements
 
@@ -59,7 +62,8 @@ Everything is environment-driven; the defaults match this deployment.
 | Variable | Default | Purpose |
 |---|---|---|
 | `LLAMA_BASE_URL` | `http://9.105.22.23:8080/v1` | llama-server OpenAI endpoint |
-| `LLAMA_MODEL_ID` | `ibm-granite/granite-4.1-30b` | Model name to request |
+| `LLAMA_MODEL_ID` | `ibm-research/granite-5.0-20B-SFT` | Model name to request |
+| `CONTEXT_TOKENS` | `32768` | Token budget for history trimming |
 | `DB_PATH` | `./data/chat.db` | SQLite file |
 | `SYSTEM_PROMPT` | see `app/config.py` | System prompt for every chat |
 | `TEMPERATURE` | `0.7` | Sampling temperature |
@@ -71,7 +75,7 @@ Check connectivity at any time:
 
 ```bash
 curl localhost:8000/api/health
-# {"ok":true,"model":"ibm-granite/granite-4.1-30b","endpoint":"…","reply":"OK"}
+# {"ok":true,"model":"ibm-research/granite-5.0-20B-SFT","endpoint":"…","reply":"OK"}
 ```
 
 The status dot at the bottom of the sidebar reflects the same probe.
@@ -88,6 +92,8 @@ static/
   index.html  Single page
   style.css   Theme
   app.js      UI, per-chat streaming client, small Markdown renderer
+  math.js     Finds LaTeX in model output and hands it to KaTeX
+  vendor/     KaTeX (MIT), js + css + woff2 fonts, ~600 KB
 ```
 
 ### Persistence
@@ -151,6 +157,25 @@ backend:
   JSON. If the model is unreachable or returns something unusable it falls back
   to a truncation of the user's own words — a failed title never breaks a working
   chat.
+
+### Math
+
+Model output is full of LaTeX, and Markdown and LaTeX disagree about `_`, `^`
+and `*`: run the Markdown pass first and `a_1 + a_2` becomes
+`a<em>1 + a</em>2`, with the original unrecoverable. KaTeX's own auto-render
+extension has the same problem — it walks the DOM after the damage is done.
+
+So `static/math.js` lifts math out of the raw text *before* the Markdown pass,
+leaving NUL sentinels that survive HTML-escaping and every emphasis rule, and
+substitutes rendered KaTeX at the very end. Fenced blocks and inline code are
+skipped, so `` `\frac{a}{b}` `` stays literal when the subject *is* LaTeX.
+`$ ... $` is only treated as math when it looks structural, so "it costs $5 and
+$7" is left alone. An opener whose closer has not streamed in yet stays literal
+and re-renders when the rest arrives, and `throwOnError: false` keeps one bad
+expression from taking down the message around it.
+
+KaTeX runs with `trust: false` (no `\href`, `\url`, `\includegraphics`) and a
+`maxExpand` cap against macro-expansion bombs.
 
 ## API
 

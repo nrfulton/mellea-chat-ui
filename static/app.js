@@ -96,7 +96,28 @@
       (_, i) => `<code>${escapeHtml(codes[Number(i)])}</code>`);
   }
 
+  // LaTeX is pulled out of the source before any of this runs and put back as
+  // rendered KaTeX afterwards, because `_`, `^` and `*` mean different things
+  // to the two grammars. See static/math.js.
   function renderMarkdown(src) {
+    const text = String(src ?? '');
+    if (!window.LatexMath) return renderBlocks(text);
+
+    const math = window.LatexMath.protect(text);
+    let html = renderBlocks(math.text);
+    // Display math is already a block; a <br /> against it is redundant and
+    // shows up as a gap. Easiest to strip while it is still a known token.
+    html = html.replace(
+      /(?:<br \/>\s*)?\u0000M(\d+)\u0000(?:\s*<br \/>)?/g,
+      (whole, index) => {
+        const span = math.spans[Number(index)];
+        return span && span.display ? `\u0000M${index}\u0000` : whole;
+      }
+    );
+    return window.LatexMath.restore(html, math.spans);
+  }
+
+  function renderBlocks(src) {
     const lines = String(src ?? '').replace(/\r\n?/g, '\n').split('\n');
     const out = [];
     let i = 0;
@@ -151,7 +172,7 @@
           buf.push(lines[i].replace(/^\s*>\s?/, ''));
           i++;
         }
-        out.push(`<blockquote>${renderMarkdown(buf.join('\n'))}</blockquote>`);
+        out.push(`<blockquote>${renderBlocks(buf.join('\n'))}</blockquote>`);
         continue;
       }
 
@@ -213,7 +234,13 @@
         buf.push(lines[i]);
         i++;
       }
-      out.push(`<p>${renderInline(buf.join('\n')).replace(/\n/g, '<br />')}</p>`);
+      const para = buf.join('\n');
+      // A paragraph holding nothing but display math needs no <p> around it.
+      if (/^(?:\u0000M\d+\u0000\s*)+$/.test(para)) {
+        out.push(para.trim());
+        continue;
+      }
+      out.push(`<p>${renderInline(para).replace(/\n/g, '<br />')}</p>`);
     }
 
     return out.join('\n');

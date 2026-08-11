@@ -24,9 +24,17 @@ class Settings:
 
     # --- Inference (llama-server, OpenAI-compatible endpoint) ---
     llama_base_url: str = os.getenv("LLAMA_BASE_URL", "http://9.105.22.23:8080/v1")
-    model_id: str = os.getenv("LLAMA_MODEL_ID", "ibm-granite/granite-4.1-30b")
+    model_id: str = os.getenv("LLAMA_MODEL_ID", "ibm-research/granite-5.0-20B-SFT")
     # llama-server ignores the key, but the OpenAI client requires a non-empty one.
     api_key: str = os.getenv("LLAMA_API_KEY", "llama-server")
+
+    # Token budget used to trim history before a request. Mellea can look this
+    # up for models in its own catalog, but not for a checkpoint served under a
+    # local name, so it is stated here instead of silently disappearing. Set it
+    # to the window the server was actually started with (`--ctx-size` for
+    # llama-server, `--max-model-len` for vLLM) rather than the model's rated
+    # maximum, which is far larger than anything typically served.
+    context_tokens: int = int(os.getenv("CONTEXT_TOKENS", "32768"))
 
     system_prompt: str = os.getenv("SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
     temperature: float = float(os.getenv("TEMPERATURE", "0.7"))
