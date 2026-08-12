@@ -24,9 +24,12 @@ database stays the single source of truth for conversation state.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
+import urllib.error
+import urllib.request
 from collections.abc import AsyncIterator, Iterable, Mapping
 from typing import Any
 
@@ -75,6 +78,12 @@ _TOOL_POLICIES = {
 _ARG_PREVIEW_CHARS = 2000
 _OUTPUT_PREVIEW_CHARS = 1200
 
+# Used as the request's model name when the endpoint is unreachable at startup
+# and nothing was pinned. llama-server ignores the field, so this is a label
+# rather than a selector — and a health probe will already be shouting.
+_UNRESOLVED_MODEL_ID = "local-model"
+_MODEL_LIST_TIMEOUT = 5.0
+
 # Strong references for detached cleanup tasks, so the loop can't collect them
 # before they run.
 _pending: set[asyncio.Task] = set()
@@ -102,21 +111,76 @@ class ChatEngine:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        # Empty until resolve_model_id() runs; a pinned LLAMA_MODEL_ID skips
+        # discovery entirely.
+        self._model_id = settings.model_id
         # Built once: the schemas mellea derives from them do not change, and
         # the tools themselves are stateless.
         self._tools = build_tools(settings)
+
+    @property
+    def model_id(self) -> str:
+        """The model name sent with every request."""
+        return self._model_id or _UNRESOLVED_MODEL_ID
 
     @property
     def tool_names(self) -> list[str]:
         """Names of the tools this engine may offer, in a stable order."""
         return [name for name in (WEB_SEARCH, RUN_PYTHON) if name in self._tools]
 
+    async def resolve_model_id(self) -> str:
+        """Adopt whatever model the endpoint is serving.
+
+        The app should follow the server rather than assert a name: a pinned
+        string goes stale the moment someone restarts llama-server with a
+        different checkpoint, and since llama-server ignores the requested name
+        entirely, the only thing a stale value breaks is what this app *reports*
+        — quietly, which is the worst way to be wrong.
+
+        An explicit `LLAMA_MODEL_ID` wins and is not second-guessed; that is the
+        way to choose among several served models. Failure is non-fatal: the app
+        starts, and the health probe reports the endpoint is unreachable.
+        """
+        if self._settings.model_id:
+            logger.info("Model pinned by LLAMA_MODEL_ID: %s", self._settings.model_id)
+            return self.model_id
+
+        try:
+            names = await asyncio.to_thread(
+                _list_models, self._settings.llama_base_url, self._settings.api_key
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not ask %s which model it serves (%s); using %r until the "
+                "endpoint answers.",
+                self._settings.llama_base_url,
+                exc,
+                _UNRESOLVED_MODEL_ID,
+            )
+            return self.model_id
+
+        if not names:
+            logger.warning("Endpoint listed no models; using %r.", _UNRESOLVED_MODEL_ID)
+            return self.model_id
+
+        self._model_id = names[0]
+        if len(names) > 1:
+            logger.info(
+                "Endpoint serves %d models %s; using the first. Set "
+                "LLAMA_MODEL_ID to choose another.",
+                len(names),
+                names,
+            )
+        else:
+            logger.info("Endpoint serves %s", self._model_id)
+        return self._model_id
+
     # --- session construction ---
 
     def _base_kwargs(self) -> dict:
         return {
             "backend_name": "openai",
-            "model_id": self._settings.model_id,
+            "model_id": self.model_id,
             "base_url": self._settings.llama_base_url,
             "api_key": self._settings.api_key,
         }
@@ -145,7 +209,7 @@ class ChatEngine:
             # mellea's model-name lookup, which returns nothing for a locally
             # served checkpoint and would leave history untrimmed.
             ctx=ChatContext(
-                model_id=self._settings.model_id,
+                model_id=self.model_id,
                 token_context_length_limit=self._settings.context_tokens,
             ),
             model_options={
@@ -444,6 +508,35 @@ class ChatEngine:
         elif len(words) < len(text.split()):
             title += "…"
         return title
+
+
+def _list_models(base_url: str, api_key: str) -> list[str]:
+    """Return the model names an OpenAI-compatible endpoint advertises.
+
+    Runs in a worker thread, so it uses `urllib` rather than dragging an async
+    HTTP client in for one request at startup. Both response shapes seen in the
+    wild are accepted: OpenAI's `data[].id`, and the `models[].model` list
+    llama-server also emits for Ollama clients.
+    """
+    url = base_url.rstrip("/") + "/models"
+    request = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    )
+    with urllib.request.urlopen(request, timeout=_MODEL_LIST_TIMEOUT) as response:
+        payload = json.loads(response.read().decode("utf-8", errors="replace"))
+
+    entries = payload.get("data") or payload.get("models") or []
+    names = []
+    for entry in entries:
+        if isinstance(entry, str):
+            name = entry
+        elif isinstance(entry, dict):
+            name = entry.get("id") or entry.get("model") or entry.get("name") or ""
+        else:
+            continue
+        if name and name not in names:
+            names.append(str(name))
+    return names
 
 
 def _clip(text: str, limit: int) -> str:

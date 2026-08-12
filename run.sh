@@ -5,12 +5,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-export LLAMA_BASE_URL="${LLAMA_BASE_URL:-http://9.105.22.23:8080/v1}"
-export LLAMA_MODEL_ID="${LLAMA_MODEL_ID:-ibm-granite/granite-4.1-30b}"
+export LLAMA_BASE_URL="${LLAMA_BASE_URL:-http://127.0.0.1:8080/v1}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8000}"
 
 echo "Chat interface  ->  http://${HOST}:${PORT}"
-echo "Inference       ->  ${LLAMA_BASE_URL}  (${LLAMA_MODEL_ID})"
+# The model is not pinned here: the app asks the endpoint what it has loaded.
+# Set LLAMA_MODEL_ID to override that.
+echo "Inference       ->  ${LLAMA_BASE_URL}  (model ${LLAMA_MODEL_ID:-auto-detected})"
 
 exec python3 -m uvicorn app.main:app --host "$HOST" --port "$PORT" "$@"

@@ -31,8 +31,14 @@ class Settings:
     """Runtime settings for the chat interface."""
 
     # --- Inference (llama-server, OpenAI-compatible endpoint) ---
-    llama_base_url: str = os.getenv("LLAMA_BASE_URL", "http://9.105.22.23:8080/v1")
-    model_id: str = os.getenv("LLAMA_MODEL_ID", "ibm-research/granite-5.0-20B-SFT")
+    # Defaults to this machine: the UI and the inference server normally run on
+    # the same box.
+    llama_base_url: str = os.getenv("LLAMA_BASE_URL", "http://127.0.0.1:8080/v1")
+    # Empty means "serve whatever the endpoint has loaded" — the engine asks it
+    # at startup (see ChatEngine.resolve_model_id). Set LLAMA_MODEL_ID only to
+    # pin a specific name, e.g. when the endpoint serves several models and you
+    # do not want the first one.
+    model_id: str = os.getenv("LLAMA_MODEL_ID", "")
     # llama-server ignores the key, but the OpenAI client requires a non-empty one.
     api_key: str = os.getenv("LLAMA_API_KEY", "llama-server")
 

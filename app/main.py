@@ -35,10 +35,12 @@ engine = ChatEngine(settings)
 async def lifespan(app: FastAPI):
     await store.connect()
     logger.info("SQLite ready at %s", settings.db_path)
+    # Ask the endpoint what it is serving instead of trusting a configured name.
+    await engine.resolve_model_id()
     logger.info(
         "Inference via mellea -> %s (model %s)",
         settings.llama_base_url,
-        settings.model_id,
+        engine.model_id,
     )
     try:
         yield
@@ -293,13 +295,18 @@ async def regenerate_title(chat_id: str) -> dict:
 
 @app.get("/api/health")
 async def health() -> JSONResponse:
-    """Report whether the llama-server behind mellea is answering."""
+    """Report whether the llama-server behind mellea is answering.
+
+    Re-asks which model is loaded, so swapping the checkpoint under a running app
+    is reflected on the next page load instead of needing a restart.
+    """
     try:
+        model = await engine.resolve_model_id()
         reply = await engine.check_backend()
         return JSONResponse(
             {
                 "ok": True,
-                "model": settings.model_id,
+                "model": model,
                 "endpoint": settings.llama_base_url,
                 "tools": engine.tool_names,
                 "reply": reply,
@@ -308,7 +315,7 @@ async def health() -> JSONResponse:
     except Exception as exc:
         logger.warning("Health probe failed: %s", exc)
         return JSONResponse(
-            {"ok": False, "model": settings.model_id, "error": str(exc)},
+            {"ok": False, "model": engine.model_id, "error": str(exc)},
             status_code=503,
         )
 

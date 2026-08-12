@@ -14,7 +14,7 @@ and the sidebar titles are short summaries written by the model itself.
 │ B-Tree Index…  │                                      │
 │ 2 messages     ├──────────────────────────────────────┤
 │                │  [ Send a message…              ] ▶  │
-│ ● granite-5.0  │  Enter to send · Shift+Enter newline  │
+│ ● granite-4.1  │  Enter to send · Shift+Enter newline  │
 └────────────────┴──────────────────────────────────────┘
 ```
 
@@ -69,8 +69,8 @@ Everything is environment-driven; the defaults match this deployment.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LLAMA_BASE_URL` | `http://9.105.22.23:8080/v1` | llama-server OpenAI endpoint |
-| `LLAMA_MODEL_ID` | `ibm-research/granite-5.0-20B-SFT` | Model name to request |
+| `LLAMA_BASE_URL` | `http://127.0.0.1:8080/v1` | llama-server OpenAI endpoint |
+| `LLAMA_MODEL_ID` | *auto-detected* | Pin a model name instead of asking the endpoint |
 | `CONTEXT_TOKENS` | `32768` | Token budget for history trimming |
 | `DB_PATH` | `./data/chat.db` | SQLite file |
 | `SYSTEM_PROMPT` | see `app/config.py` | System prompt for every chat |
@@ -99,7 +99,7 @@ Check connectivity at any time:
 
 ```bash
 curl localhost:8000/api/health
-# {"ok":true,"model":"ibm-research/granite-5.0-20B-SFT","endpoint":"…",
+# {"ok":true,"model":"ibm-granite/granite-4.1-30b","endpoint":"…",
 #  "tools":["web_search","run_python"],"reply":"OK"}
 ```
 
@@ -188,6 +188,18 @@ backend:
   JSON. If the model is unreachable or returns something unusable it falls back
   to a truncation of the user's own words — a failed title never breaks a working
   chat.
+
+**The model is not hardcoded.** At startup — and again on every health probe, so
+swapping the checkpoint under a running app is picked up on the next page load —
+`resolve_model_id()` asks the endpoint's `/v1/models` what it has loaded and uses
+that. Both response shapes are accepted: OpenAI's `data[].id` and the
+`models[].model` list llama-server also emits. This matters less for generation
+than it looks — llama-server ignores the requested model name and serves whatever
+is loaded — and more for honesty: a pinned name that has drifted makes
+`/api/health` and the sidebar report a model the box is not running. If the
+endpoint serves several models the first is used; set `LLAMA_MODEL_ID` to pin one
+explicitly, which skips discovery entirely. If the endpoint is unreachable the app
+still starts, labels the model `local-model`, and retries on the next probe.
 
 ### Tools
 
