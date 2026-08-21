@@ -84,6 +84,22 @@ class Settings:
     python_timeout: float = float(os.getenv("PYTHON_TIMEOUT", "15"))
     python_memory_mb: int = int(os.getenv("PYTHON_MEMORY_MB", "512"))
 
+    # --- Policy guards (the `m mitm --admin` proxy) ---
+    # Base URL of an `m mitm` proxy started with --admin, whose policy registry this UI
+    # manages. Empty disables the feature: /api/policies answers 503 and the sidebar
+    # button stays hidden, which is the default so nothing changes for a plain install.
+    #
+    # Note this is separate from LLAMA_BASE_URL. Managing a proxy's guards does not put
+    # this UI behind it -- point LLAMA_BASE_URL at the proxy as well (normally the same
+    # host with /v1 appended) if these chats should be screened by the guards.
+    mitm_base_url: str = os.getenv("MITM_BASE_URL", "")
+    # Sent as `Authorization: Bearer`. Must match the proxy's --admin-token. Empty means
+    # the proxy is not asking for one.
+    mitm_token: str = os.getenv("MITM_TOKEN", "")
+    # The control plane only parses YAML, so it answers fast or not at all; no reason for
+    # the generous timeout inference gets.
+    mitm_timeout: float = float(os.getenv("MITM_TIMEOUT", "10"))
+
     # --- Storage ---
     db_path: Path = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "chat.db")))
 

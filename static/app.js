@@ -37,6 +37,13 @@
     banner: $('banner'),
     modelDot: $('model-dot'),
     modelName: $('model-name'),
+    guardsBtn: $('guards-btn'),
+    guardsDialog: $('guards'),
+    guardsSub: $('guards-sub'),
+    guardsBanner: $('guards-banner'),
+    guardsBody: $('guards-body'),
+    guardsFoot: $('guards-foot'),
+    guardsClose: $('guards-close'),
   };
 
   // -------------------------------------------------------------------- api
@@ -801,10 +808,493 @@
     if (state.streams.size) { e.preventDefault(); e.returnValue = ''; }
   });
 
+  // ---------------------------------------------------------------- guards
+  // CRUD for the policies an `m mitm --admin` proxy screens replies against. Documents
+  // follow the granite.trust.policy-tools schema and are edited field by field.
+  //
+  // The proxy owns the schema: nothing here re-implements its validation, so a rejected
+  // save shows the parser's own message and this stays correct if the schema grows a
+  // field. Every node is built with createElement and textContent, as elsewhere in this
+  // file, so policy text is never parsed as markup.
+  const guards = {
+    entries: [],   // [{policy, enabled}] as the proxy reports them
+    draft: null,   // {key, policy, enabled} while editing, else null
+    busy: false,   // a toggle is in flight; blocks a second one
+  };
+
+  function guardBanner(msg) {
+    el.guardsBanner.textContent = msg;
+    el.guardsBanner.hidden = !msg;
+  }
+
+  function closeGuards() {
+    el.guardsDialog.close();
+  }
+
+  async function openGuards() {
+    guards.draft = null;
+    guardBanner('');
+    el.guardsDialog.showModal();
+    await refreshGuards();
+  }
+
+  async function refreshGuards() {
+    try {
+      const { policies } = await api('/api/policies');
+      guards.entries = policies;
+      guardBanner('');
+    } catch (err) {
+      guards.entries = [];
+      guardBanner(err.message);
+    }
+    renderGuards();
+  }
+
+  function countRestrictions(policy) {
+    return (policy.risks || []).reduce(
+      (n, risk) => n + (risk.policy?.reply_cannot_contain?.length || 0), 0);
+  }
+
+  function blankRisk() {
+    return {
+      risk: '', risk_id: '', description: '',
+      reason_denial: null, short_reply_type: null, exception: null,
+      policy: { reply_cannot_contain: [''], reply_may_contain: [''] },
+    };
+  }
+
+  function blankPolicy() {
+    return {
+      risk_group: '', risk_group_id: '', description: '',
+      policy_version: 'v1.0', risks: [blankRisk()],
+    };
+  }
+
+  // Fill in anything a document is allowed to leave out, so the form can bind to every
+  // field without checking each one for existence first.
+  function normalizePolicy(policy) {
+    const out = { ...blankPolicy(), ...policy };
+    out.risks = (policy.risks || []).map((risk) => ({
+      ...blankRisk(), ...risk,
+      policy: {
+        reply_cannot_contain: [...(risk.policy?.reply_cannot_contain || [])],
+        reply_may_contain: [...(risk.policy?.reply_may_contain || [])],
+      },
+    }));
+    if (!out.risks.length) out.risks = [blankRisk()];
+    return out;
+  }
+
+  // ---- shared bits of chrome ----
+  function guardButton(label, onClick, { kind = '', title = '' } = {}) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = kind ? `g-btn ${kind}` : 'g-btn';
+    b.textContent = label;
+    if (title) b.title = title;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function guardField(label, value, onInput, opts = {}) {
+    const { placeholder = '', hint = '', mono = false, wide = false } = opts;
+    const wrap = document.createElement('label');
+    wrap.className = wide ? 'g-field wide' : 'g-field';
+
+    const name = document.createElement('span');
+    name.className = 'g-label';
+    name.textContent = label;
+    wrap.appendChild(name);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = value ?? '';
+    input.placeholder = placeholder;
+    if (mono) input.classList.add('mono');
+    input.addEventListener('input', () => onInput(input.value));
+    wrap.appendChild(input);
+
+    if (hint) {
+      const note = document.createElement('span');
+      note.className = 'g-hint';
+      note.textContent = hint;
+      wrap.appendChild(note);
+    }
+    return wrap;
+  }
+
+  // An editable list of restriction lines.
+  //
+  // The DOM is the source of truth here: every change rewrites the whole array from the
+  // inputs, so there is no index bookkeeping to desynchronise when a line is added or
+  // removed, and nothing re-renders under the caret while typing.
+  function guardList(label, items, hint, placeholder) {
+    const box = document.createElement('div');
+    box.className = 'g-list';
+
+    const head = document.createElement('span');
+    head.className = 'g-label';
+    head.textContent = label;
+    box.appendChild(head);
+
+    const note = document.createElement('span');
+    note.className = 'g-hint';
+    note.textContent = hint;
+    box.appendChild(note);
+
+    const rows = document.createElement('div');
+    rows.className = 'g-list-rows';
+
+    const sync = () => {
+      items.length = 0;
+      for (const input of rows.querySelectorAll('input')) items.push(input.value);
+    };
+
+    const addRow = (value, { focus = false } = {}) => {
+      const row = document.createElement('div');
+      row.className = 'g-list-row';
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = value ?? '';
+      input.placeholder = placeholder;
+      input.addEventListener('input', sync);
+
+      const drop = document.createElement('button');
+      drop.type = 'button';
+      drop.className = 'icon-btn danger g-drop';
+      drop.title = 'Remove this line';
+      drop.setAttribute('aria-label', 'Remove this line');
+      const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('aria-hidden', 'true');
+      const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      path.setAttribute('d', 'M6 6l12 12M18 6L6 18');
+      svg.appendChild(path);
+      drop.appendChild(svg);
+      drop.addEventListener('click', () => { row.remove(); sync(); });
+
+      row.append(input, drop);
+      rows.appendChild(row);
+      if (focus) input.focus();
+    };
+
+    (items.length ? items : ['']).forEach((item) => addRow(item));
+    box.appendChild(rows);
+    box.appendChild(
+      guardButton('+ Add line', () => addRow('', { focus: true }), { kind: 'quiet' }));
+    return box;
+  }
+
+  // ---- list view ----
+  function renderGuards() {
+    el.guardsBody.replaceChildren();
+    el.guardsFoot.replaceChildren();
+    if (guards.draft) renderGuardForm();
+    else renderGuardList();
+  }
+
+  function renderGuardList() {
+    const total = guards.entries.length;
+    const enforced = guards.entries.filter((e) => e.enabled).length;
+    el.guardsSub.textContent = total
+      ? `${total} ${total === 1 ? 'policy' : 'policies'}, ${enforced} enforced`
+      : 'This proxy is screening nothing';
+
+    if (!total) {
+      const empty = document.createElement('p');
+      empty.className = 'g-empty';
+      empty.textContent = 'No policies are registered, so every reply the proxy relays '
+        + 'reaches you unscreened.';
+      el.guardsBody.appendChild(empty);
+    }
+
+    for (const entry of guards.entries) el.guardsBody.appendChild(guardRow(entry));
+
+    el.guardsFoot.append(
+      guardButton('Done', closeGuards),
+      guardButton('New policy', () => startGuardDraft(null), { kind: 'primary' }),
+    );
+  }
+
+  function guardRow(entry) {
+    const policy = entry.policy;
+    const row = document.createElement('div');
+    row.className = entry.enabled ? 'g-row' : 'g-row parked';
+
+    const main = document.createElement('div');
+    main.className = 'g-row-main';
+
+    const name = document.createElement('span');
+    name.className = 'g-row-name';
+    name.textContent = policy.risk_group;
+    main.appendChild(name);
+
+    const risks = (policy.risks || []).length;
+    const rules = countRestrictions(policy);
+    const bits = [];
+    if (policy.risk_group_id) bits.push(`id ${policy.risk_group_id}`);
+    bits.push(`${risks} ${risks === 1 ? 'risk' : 'risks'}`);
+    bits.push(`${rules} ${rules === 1 ? 'restriction' : 'restrictions'}`);
+    if (policy.policy_version) bits.push(policy.policy_version);
+
+    const meta = document.createElement('span');
+    meta.className = 'g-row-meta';
+    meta.textContent = bits.join(' · ');
+    main.appendChild(meta);
+
+    if (policy.description) {
+      const desc = document.createElement('span');
+      desc.className = 'g-row-desc';
+      desc.textContent = policy.description;
+      main.appendChild(desc);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'g-row-actions';
+    actions.append(
+      guardSwitch(entry),
+      guardButton('Edit', () => startGuardDraft(entry), { kind: 'quiet' }),
+      guardButton('Delete', () => deleteGuard(entry), { kind: 'quiet danger' }),
+    );
+
+    row.append(main, actions);
+    return row;
+  }
+
+  function guardSwitch(entry) {
+    const wrap = document.createElement('label');
+    wrap.className = 'g-switch';
+    wrap.title = entry.enabled
+      ? 'Enforced. Switch off to park it without deleting it.'
+      : 'Parked: registered, but not screened against.';
+
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = entry.enabled;
+    box.disabled = guards.busy;
+    box.addEventListener('change', () => toggleGuard(entry, box.checked));
+
+    const track = document.createElement('span');
+    track.className = 'g-track';
+
+    const text = document.createElement('span');
+    text.className = 'g-switch-text';
+    text.textContent = entry.enabled ? 'Enforced' : 'Parked';
+
+    wrap.append(box, track, text);
+    return wrap;
+  }
+
+  // ---- form view ----
+  function startGuardDraft(entry) {
+    guardBanner('');
+    guards.draft = entry
+      ? { key: entry.policy.risk_group, policy: normalizePolicy(entry.policy), enabled: null }
+      : { key: null, policy: blankPolicy(), enabled: true };
+    // enabled: null on an edit means "leave it as it is", so saving a change to a parked
+    // guard does not quietly arm it.
+    renderGuards();
+    el.guardsBody.querySelector('input')?.focus();
+  }
+
+  function renderGuardForm() {
+    const { key, policy } = guards.draft;
+    el.guardsSub.textContent = key === null
+      ? 'New policy. Live on the next reply the proxy screens.'
+      : `Editing ${key}. Live on the next reply the proxy screens.`;
+
+    el.guardsBody.appendChild(guardGroupBlock(policy));
+    policy.risks.forEach((risk, i) => {
+      el.guardsBody.appendChild(guardRiskBlock(risk, i));
+    });
+
+    const add = guardButton('+ Add risk', () => {
+      policy.risks.push(blankRisk());
+      renderGuards();
+      const blocks = el.guardsBody.querySelectorAll('.g-risk');
+      blocks[blocks.length - 1]?.querySelector('input')?.focus();
+    });
+    add.classList.add('g-add-risk');
+    el.guardsBody.appendChild(add);
+
+    el.guardsFoot.append(
+      guardButton('Cancel', cancelGuardDraft),
+      guardButton(key === null ? 'Create' : 'Save', saveGuard, { kind: 'primary' }),
+    );
+  }
+
+  function guardGroupBlock(policy) {
+    const box = document.createElement('section');
+    box.className = 'g-block';
+
+    const head = document.createElement('h3');
+    head.className = 'g-block-head';
+    head.textContent = 'Risk group';
+    box.appendChild(head);
+
+    const grid = document.createElement('div');
+    grid.className = 'g-grid';
+    grid.append(
+      guardField('Name', policy.risk_group, (v) => { policy.risk_group = v; },
+        { placeholder: 'alcohol_consumption_prohibited', mono: true,
+          hint: 'Required. Identifies the policy on the proxy.' }),
+      guardField('Group id', policy.risk_group_id, (v) => { policy.risk_group_id = v; },
+        { placeholder: '11', mono: true, hint: 'Optional second handle for the policy.' }),
+      guardField('Version', policy.policy_version, (v) => { policy.policy_version = v; },
+        { placeholder: 'v1.0', mono: true }),
+    );
+    box.appendChild(grid);
+
+    box.appendChild(guardField('Description', policy.description,
+      (v) => { policy.description = v; },
+      { placeholder: 'What this group covers and where it applies', wide: true }));
+    return box;
+  }
+
+  function guardRiskBlock(risk, index) {
+    const box = document.createElement('section');
+    box.className = 'g-block g-risk';
+
+    const bar = document.createElement('div');
+    bar.className = 'g-block-bar';
+    const title = document.createElement('h3');
+    title.className = 'g-block-head';
+    title.textContent = `Risk ${index + 1}`;
+    bar.appendChild(title);
+    if (guards.draft.policy.risks.length > 1) {
+      bar.appendChild(guardButton('Remove risk', () => {
+        guards.draft.policy.risks.splice(index, 1);
+        renderGuards();
+      }, { kind: 'quiet danger' }));
+    }
+    box.appendChild(bar);
+
+    const grid = document.createElement('div');
+    grid.className = 'g-grid';
+    grid.append(
+      guardField('Risk', risk.risk, (v) => { risk.risk = v; },
+        { placeholder: 'alcohol_general_requests', mono: true, hint: 'Required.' }),
+      guardField('Risk id', risk.risk_id, (v) => { risk.risk_id = v; },
+        { placeholder: '11.1', mono: true }),
+    );
+    box.appendChild(grid);
+
+    box.appendChild(guardField('Description', risk.description,
+      (v) => { risk.description = v; },
+      { placeholder: 'What kind of request this risk covers', wide: true }));
+
+    const codes = document.createElement('div');
+    codes.className = 'g-grid';
+    codes.append(
+      guardField('Denial reason', risk.reason_denial,
+        (v) => { risk.reason_denial = v.trim() || null; },
+        { placeholder: 'ALCOHOL_PROHIBITED', mono: true,
+          hint: 'Shown with the canned refusal when no reply can be composed.' }),
+      guardField('Short reply type', risk.short_reply_type,
+        (v) => { risk.short_reply_type = v.trim() || null; },
+        { placeholder: 'EXPLICIT_REFUSAL', mono: true,
+          hint: 'Advisory only. The proxy carries it but does not act on it.' }),
+      guardField('Exception', risk.exception,
+        (v) => { risk.exception = v.trim() || null; },
+        { placeholder: 'ALCOHOL_REQUEST_EXCEPTION', mono: true }),
+    );
+    box.appendChild(codes);
+
+    box.appendChild(guardList(
+      'Reply cannot contain', risk.policy.reply_cannot_contain,
+      'What a reply may not say. Each line is scored against every reply the proxy '
+      + 'relays, one model call each, so a long list is a slower proxy.',
+      'Recommendations for alcoholic beverages'));
+
+    box.appendChild(guardList(
+      'Reply may contain', risk.policy.reply_may_contain,
+      'The brief for writing the replacement. With no lines here a blocked reply becomes '
+      + 'a canned refusal instead.',
+      'Polite refusal explaining that assistance is unavailable'));
+
+    return box;
+  }
+
+  // ---- writes ----
+  function cancelGuardDraft() {
+    guards.draft = null;
+    guardBanner('');
+    renderGuards();
+  }
+
+  async function saveGuard() {
+    const { key, policy, enabled } = guards.draft;
+    const body = JSON.stringify({ policy, enabled });
+    try {
+      if (key === null) await api('/api/policies', { method: 'POST', body });
+      else await api(`/api/policies/${encodeURIComponent(key)}`, { method: 'PUT', body });
+    } catch (err) {
+      // The proxy validated it, so its message names the field that is wrong.
+      guardBanner(err.message);
+      return;
+    }
+    guards.draft = null;
+    await refreshGuards();
+  }
+
+  async function toggleGuard(entry, enabled) {
+    if (guards.busy) return;
+    guards.busy = true;
+    const previous = entry.enabled;
+    entry.enabled = enabled;   // optimistic: the switch should not lag the click
+    renderGuards();
+    try {
+      Object.assign(entry, await api(
+        `/api/policies/${encodeURIComponent(entry.policy.risk_group)}`,
+        { method: 'PATCH', body: JSON.stringify({ enabled }) }));
+      guardBanner('');
+    } catch (err) {
+      entry.enabled = previous;
+      guardBanner(err.message);
+    } finally {
+      guards.busy = false;
+      renderGuards();
+    }
+  }
+
+  async function deleteGuard(entry) {
+    const name = entry.policy.risk_group;
+    if (!confirm(
+      `Delete "${name}"? The proxy stops screening replies against it immediately.`
+    )) return;
+    try {
+      await api(`/api/policies/${encodeURIComponent(name)}`, { method: 'DELETE' });
+    } catch (err) {
+      guardBanner(err.message);
+      return;
+    }
+    await refreshGuards();
+  }
+
+  el.guardsBtn.addEventListener('click', openGuards);
+  el.guardsClose.addEventListener('click', closeGuards);
+
+  // Clicking the backdrop closes the panel, but not out from under a half-written policy.
+  el.guardsDialog.addEventListener('click', (e) => {
+    if (e.target === el.guardsDialog && !guards.draft) closeGuards();
+  });
+
+  // Esc closes a <dialog> natively; make that path drop the draft too.
+  el.guardsDialog.addEventListener('close', () => {
+    guards.draft = null;
+    guardBanner('');
+  });
+
   // ------------------------------------------------------------------- boot
   async function checkHealth() {
+    // Read the body whatever the status: a 503 still reports the guards, and the policy
+    // proxy can be answering perfectly well while the model behind it is not.
+    let info = null;
     try {
-      const info = await api('/api/health');
+      const res = await fetch('/api/health');
+      info = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(info?.error || res.statusText);
       el.modelDot.className = 'model-dot ok';
       el.modelName.textContent = info.model;
       el.modelName.title = `Connected · ${info.model}`;
@@ -813,6 +1303,7 @@
       el.modelName.textContent = 'inference unreachable';
       el.modelName.title = err.message;
     }
+    el.guardsBtn.hidden = !info?.guards?.available;
   }
 
   async function boot() {

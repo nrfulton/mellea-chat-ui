@@ -28,6 +28,10 @@
       <footer class="sidebar-foot">
         <span class="model-dot" id="model-dot"></span>
         <span class="model-name" id="model-name">connecting…</span>
+        <button class="icon-btn guards-btn" id="guards-btn" hidden
+                title="Policy guards" aria-label="Policy guards">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.4-3 8-7 9-4-1-7-4.6-7-9V6l7-3Z"/></svg>
+        </button>
       </footer>
     </aside>
 
@@ -69,6 +73,22 @@
       </div>
     </main>
   </div>
+
+  <!-- Policy guards: CRUD over the policies the m mitm proxy is enforcing. -->
+  <dialog class="sheet" id="guards" aria-labelledby="guards-title">
+    <header class="sheet-head">
+      <div class="sheet-heading">
+        <h2 id="guards-title">Policy guards</h2>
+        <p class="sheet-sub" id="guards-sub"></p>
+      </div>
+      <button class="icon-btn" id="guards-close" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </header>
+    <div class="sheet-banner" id="guards-banner" hidden></div>
+    <div class="sheet-body" id="guards-body"></div>
+    <footer class="sheet-foot" id="guards-foot"></footer>
+  </dialog>
 
   <script src="/static/vendor/katex/katex.min.js"></script>
   <script src="/static/math.js"></script>

@@ -38,6 +38,10 @@ and the sidebar titles are short summaries written by the model itself.
   the usual environments (`align`, `cases`, `pmatrix`, ...) are typeset with KaTeX.
 - **Rename, regenerate title, delete.** A manual rename is never overwritten, and
   deletes are soft — the rows stay on disk behind a flag.
+- **Policy guards.** When the app is pointed at an `m mitm --admin` proxy, the shield
+  in the sidebar footer opens a panel that manages the behavioural policies that
+  proxy screens replies against — create, edit, switch on and off, delete, live on
+  the next reply. See [Policy guards](#policy-guards).
 - Light and dark themes, keyboard shortcuts, and no build step. KaTeX is vendored
   rather than loaded from a CDN, so nothing is fetched at runtime.
 
@@ -79,6 +83,14 @@ Everything is environment-driven; the defaults match this deployment.
 | `STREAM_TIMEOUT` | `120` | Seconds to wait for one chunk |
 | `HOST` / `PORT` | `127.0.0.1` / `8000` | Bind address |
 
+The policy guard panel is off until you point it at a proxy:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MITM_BASE_URL` | *empty* | Base URL of an `m mitm --admin` proxy. Empty hides the panel |
+| `MITM_TOKEN` | *empty* | Must match the proxy's `--admin-token` |
+| `MITM_TIMEOUT` | `10` | Seconds to wait on a control-plane call |
+
 Tools have their own block, all optional:
 
 | Variable | Default | Purpose |
@@ -100,10 +112,59 @@ Check connectivity at any time:
 ```bash
 curl localhost:8000/api/health
 # {"ok":true,"model":"ibm-granite/granite-4.1-30b","endpoint":"…",
-#  "tools":["web_search","run_python"],"reply":"OK"}
+#  "tools":["web_search","run_python"],"reply":"OK",
+#  "guards":{"configured":true,"available":true,"count":2}}
 ```
 
-The status dot at the bottom of the sidebar reflects the same probe.
+The status dot at the bottom of the sidebar reflects the same probe. `guards` is
+reported whether or not inference is healthy, because the proxy can be answering
+while the model behind it is not — the panel stays reachable either way.
+
+## Policy guards
+
+[`m mitm`](https://docs.mellea.ai) is a mellea proxy that fronts an
+OpenAI-compatible server and screens the replies it relays against behavioural
+policies in the [`granite.trust.policy-tools`](https://github.com/ibm-granite/granite.trust.policy-tools)
+schema. Each policy names a risk group; each risk under it lists what a reply
+`reply_cannot_contain`, and a reply that trips one is replaced by a refusal composed
+from that risk's `reply_may_contain` guidance.
+
+Those policies are otherwise fixed when the proxy starts. Start it with `--admin` and
+this app can manage them while it runs:
+
+```bash
+# 1. the proxy, in front of llama-server, with the control plane on
+m mitm --upstream http://127.0.0.1:8080 \
+       --policy policies/ --admin --admin-token s3cret \
+       --host 127.0.0.1 --port 8081
+
+# 2. this app, managing that proxy *and* generating through it
+MITM_BASE_URL=http://127.0.0.1:8081 MITM_TOKEN=s3cret \
+LLAMA_BASE_URL=http://127.0.0.1:8081/v1 ./run.sh
+```
+
+The shield button appears in the sidebar footer once the proxy answers. Everything the
+panel does takes effect on the next reply the proxy screens; there is nothing to
+restart and nothing written to disk, so a policy lives only as long as the proxy does.
+
+**Two independent settings.** `MITM_BASE_URL` decides which proxy's guards you
+*manage*; `LLAMA_BASE_URL` decides where replies *come from*. Point the second at the
+proxy as above and the guards apply to these chats. Leave it at llama-server and the
+panel still works, but it is administering a proxy other clients use — nothing you
+say in this window is screened.
+
+**Switch off versus delete.** A parked policy stays registered and editable but is not
+screened against, which also means it stops costing anything: each restriction is a
+separate model call on every reply, so a long policy is a slower proxy. Deleting is
+what forgets it.
+
+**The proxy owns validation.** The form does not check the schema — it sends the
+document and shows whatever the proxy says, so an error names the field mellea itself
+objected to.
+
+> **Note:** the control plane can delete a guardrail, and `m mitm` binds every
+> interface unless told otherwise. Give it an `--admin-token` and bind it to loopback,
+> as above.
 
 ## Layout
 
@@ -113,6 +174,7 @@ app/
   store.py    ChatStore (abstract) + SQLiteChatStore
   engine.py   Mellea orchestration: streaming replies, tool rounds, titles
   tools.py    The two tools themselves: web search and the Python subprocess
+  policies.py Client for the m mitm policy control plane
   main.py     FastAPI routes and the NDJSON streaming endpoint
 static/
   index.html  Single page
@@ -296,7 +358,19 @@ KaTeX runs with `trust: false` (no `\href`, `\url`, `\includegraphics`) and a
 | `DELETE` | `/api/chats/{id}` | Soft-delete a chat and its messages |
 | `POST` | `/api/chats/{id}/messages` | Send a message, stream the reply |
 | `POST` | `/api/chats/{id}/title` | Regenerate the title now |
-| `GET` | `/api/health` | Probe the llama-server |
+| `GET` | `/api/health` | Probe the llama-server and the policy proxy |
+| `GET` | `/api/policies` | List the proxy's policies, enforced or parked |
+| `GET` | `/api/policies/{key}` | One policy, by risk group name or id |
+| `POST` | `/api/policies` | Register a policy (`409` if the name is taken) |
+| `PUT` | `/api/policies/{key}` | Replace a policy, optionally renaming it |
+| `PATCH` | `/api/policies/{key}` | `{"enabled": bool}` — enforce or park it |
+| `DELETE` | `/api/policies/{key}` | Forget a policy |
+
+The `/api/policies` routes are a thin pass-through onto the proxy's own control
+plane, so the browser never talks to the proxy and the admin token stays here. They
+answer `503` when `MITM_BASE_URL` is unset or the proxy cannot be reached, and relay
+the proxy's status and message otherwise — a malformed policy comes back as the `422`
+mellea's own parser produced.
 
 `POST /api/chats/{id}/messages` streams newline-delimited JSON — one object per
 line — rather than SSE, so the client can POST the message and abort mid-stream:

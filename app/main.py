@@ -12,14 +12,16 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
 from .config import settings
 from .engine import ChatEngine
+from .policies import PolicyClient, PolicyServiceError
 from .store import Chat, ChatStore, SQLiteChatStore
 
 logging.basicConfig(
@@ -29,6 +31,8 @@ logger = logging.getLogger("chat")
 
 store: ChatStore = SQLiteChatStore(settings.db_path)
 engine = ChatEngine(settings)
+# Inert unless MITM_BASE_URL is set, in which case it manages that proxy's guardrails.
+policies = PolicyClient(settings)
 
 
 @asynccontextmanager
@@ -42,6 +46,8 @@ async def lifespan(app: FastAPI):
         settings.llama_base_url,
         engine.model_id,
     )
+    if policies.configured:
+        logger.info("Policy guards -> %s", settings.mitm_base_url)
     try:
         yield
     finally:
@@ -65,6 +71,25 @@ class NewMessage(BaseModel):
         if not v.strip():
             raise ValueError("content must not be blank")
         return v
+
+
+class PolicyPayload(BaseModel):
+    """A policy to register, in the proxy's own request shape.
+
+    The document is passed through unvalidated: the proxy owns the schema, and validating
+    it twice would mean two implementations of it that can disagree.
+    """
+
+    policy: dict[str, Any]
+    # None leaves a policy as enforced or parked as it already was, so saving an edit to a
+    # parked guard does not arm it.
+    enabled: bool | None = None
+
+
+class SetEnabled(BaseModel):
+    """Whether a policy should be enforced."""
+
+    enabled: bool
 
 
 class RenameChat(BaseModel):
@@ -289,6 +314,63 @@ async def regenerate_title(chat_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------
+# Policy guards
+# --------------------------------------------------------------------------
+#
+# Thin proxy onto the control plane of an `m mitm --admin` server. Going through this app
+# rather than letting the browser call the proxy keeps the admin token server-side and
+# means no cross-origin configuration, at the cost of one extra hop on a rare request.
+
+
+@app.exception_handler(PolicyServiceError)
+async def policy_service_error(request: Request, exc: PolicyServiceError) -> JSONResponse:
+    """Report a control-plane failure with the status and message it arrived with.
+
+    Uses `detail` because that is what every other error from this app uses, so the
+    frontend needs no second error shape -- including the proxy's own 422 text, which is
+    the part that tells the user which field of their policy is wrong.
+    """
+    return JSONResponse({"detail": str(exc)}, status_code=exc.status)
+
+
+@app.get("/api/policies")
+async def list_policies() -> dict:
+    """List the policies the proxy is holding, enforced or parked."""
+    return {"policies": await policies.list()}
+
+
+@app.get("/api/policies/{key}")
+async def get_policy(key: str) -> dict:
+    """Read one policy, by risk group name or id."""
+    return await policies.get(key)
+
+
+@app.post("/api/policies", status_code=201)
+async def create_policy(payload: PolicyPayload) -> dict:
+    """Register a new policy. The proxy refuses a risk group that already exists."""
+    return await policies.create(payload.policy, enabled=payload.enabled)
+
+
+@app.put("/api/policies/{key}")
+async def replace_policy(key: str, payload: PolicyPayload) -> dict:
+    """Overwrite a policy, optionally renaming its risk group."""
+    return await policies.replace(key, payload.policy, enabled=payload.enabled)
+
+
+@app.patch("/api/policies/{key}")
+async def set_policy_enabled(key: str, payload: SetEnabled) -> dict:
+    """Start or stop enforcing a policy without deleting it."""
+    return await policies.set_enabled(key, payload.enabled)
+
+
+@app.delete("/api/policies/{key}", status_code=204)
+async def delete_policy(key: str):
+    """Remove a policy from the proxy."""
+    await policies.delete(key)
+    return None
+
+
+# --------------------------------------------------------------------------
 # Health + static frontend
 # --------------------------------------------------------------------------
 
@@ -299,7 +381,17 @@ async def health() -> JSONResponse:
 
     Re-asks which model is loaded, so swapping the checkpoint under a running app
     is reflected on the next page load instead of needing a restart.
+
+    Also reports whether the policy proxy is answering, which is what decides if the UI
+    offers the guards panel at all. Probed before the inference check and reported in both
+    branches, so an inference outage does not hide a control plane that is perfectly fine.
     """
+    guard_count = await policies.count() if policies.configured else -1
+    guards = {
+        "configured": policies.configured,
+        "available": guard_count >= 0,
+        "count": max(guard_count, 0),
+    }
     try:
         model = await engine.resolve_model_id()
         reply = await engine.check_backend()
@@ -310,12 +402,18 @@ async def health() -> JSONResponse:
                 "endpoint": settings.llama_base_url,
                 "tools": engine.tool_names,
                 "reply": reply,
+                "guards": guards,
             }
         )
     except Exception as exc:
         logger.warning("Health probe failed: %s", exc)
         return JSONResponse(
-            {"ok": False, "model": engine.model_id, "error": str(exc)},
+            {
+                "ok": False,
+                "model": engine.model_id,
+                "error": str(exc),
+                "guards": guards,
+            },
             status_code=503,
         )
 
